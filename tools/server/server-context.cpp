@@ -1068,6 +1068,26 @@ public:
         return metrics;
     }
 
+    // called after the task loop stopped: keep the slot and RAM cache states for the next start
+    void flush_prompt_cache() {
+        if (!prompt_cache || prompt_cache->disk_dir.empty()) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // a sleeping server has no llama context, its slots hold nothing
+        if (!sleeping) {
+            for (auto & slot : slots) {
+                slot.prompt_save(*prompt_cache);
+            }
+        }
+
+        prompt_cache->disk_flush();
+
+        SRV_INF("prompt cache flush took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -1603,8 +1623,35 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (!params_base.cache_disk_path.empty()) {
+                // files are only loaded back by the same model and KV/draft setup
+                char desc[256] = {};
+                llama_model_desc(model_tgt, desc, sizeof(desc));
+                // model path too: finetunes share desc/size with their base model
+                // model mtime: a new version downloaded over the same file name keeps desc and size
+                std::error_code ec;
+                const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
+                std::string fp = string_format("%s|%lld|%s|%" PRIu64 "|%" PRIu64 "|%d|%d|%d|%d", params_base.model.path.c_str(),
+                        ec ? 0LL : (long long) mtime.time_since_epoch().count(), desc,
+                        llama_model_n_params(model_tgt), llama_model_size(model_tgt),
+                        (int) params_base.cache_type_k, (int) params_base.cache_type_v,
+                        (int) params_base.flash_attn_type, ctx_dft != nullptr);
+                // RoPE/YaRN overrides and LoRA adapters change the cached KV values too
+                fp += string_format("|rope %d %g %g|yarn %g %g %g %g %d", (int) params_base.rope_scaling_type,
+                        params_base.rope_freq_base, params_base.rope_freq_scale,
+                        params_base.yarn_ext_factor, params_base.yarn_attn_factor,
+                        params_base.yarn_beta_fast, params_base.yarn_beta_slow, params_base.yarn_orig_ctx);
+                for (const auto & la : params_base.lora_adapters) {
+                    fp += string_format("|lora %s %g", la.path.c_str(), la.scale);
+                }
+                prompt_cache->disk_init(params_base.cache_disk_path, params_base.cache_disk_mib, fp, mctx != nullptr);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            if (!params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-disk has no effect: it stores entries evicted from the RAM prompt cache, which is disabled\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -5226,6 +5273,7 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    impl->flush_prompt_cache();
 }
 
 void server_context::terminate() {
