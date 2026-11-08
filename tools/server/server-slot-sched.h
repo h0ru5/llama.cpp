@@ -3,8 +3,10 @@
 #include "server-common.h"
 #include "server-task.h"
 
+#include <functional>
 #include <list>
 #include <memory>
+#include <string>
 #include <vector>
 
 // which prompt goes to which slot: slot prompt state, prompt cache and slot selection
@@ -101,6 +103,44 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // disk tier: entries evicted from RAM are written to disk_dir and read back on a prefix hit
+    struct disk_entry {
+        server_tokens tokens;
+        std::string   path;
+        size_t        size;
+    };
+
+    std::list<disk_entry> disk; // oldest first
+
+    std::string disk_dir;       // empty = disabled
+    // the lora config of the entries on disk (the global one, it is part of disk_fp), other configs are not written
+    std::vector<common_adapter_lora_info> disk_lora;
+    std::string disk_fp;        // model fingerprint, files written for another model are ignored
+    size_t      disk_limit = 0; // in bytes, 0 = no limit
+    bool        disk_mtmd  = false;
+    uint64_t    disk_seq   = 0;
+
+    // never fill the disk, other processes (and the OS) share it
+    static constexpr uint64_t disk_headroom = 2ull*1024*1024*1024;
+
+    // free bytes in disk_dir, std::filesystem::space() when empty (replaced in tests)
+    std::function<uint64_t(const std::string & dir)> disk_free;
+
+    void disk_init(const std::string & dir, int32_t limit_mib, const std::string & fp, bool has_mtmd);
+
+    // drop the oldest RAM entry, writing it to disk first
+    void evict_front();
+
+    // on shutdown: write the RAM entries to disk, the newest ones that fit the size cap
+    void disk_flush();
+
+    bool disk_write(const server_prompt_cache_state & state);
+
+    // write one entry to path via "path.tmp", returns the file size or 0 on failure
+    size_t disk_write_file(const server_prompt_cache_state & state, const std::vector<char> & packed, const std::string & path) const;
+    bool disk_read(const disk_entry & entry, server_prompt_cache_state & state) const;
+    void disk_trim(size_t size_new);
 };
 
 // what the scheduler needs to know about a slot
